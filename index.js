@@ -2,6 +2,7 @@
 require('dotenv/config');
 const express = require('express');
 const dayjs = require('dayjs');
+const { DAVClient, fetchCalendars, fetchCalendarObjects, createObject, updateObject } = require('tsdav');
 
 const app = express();
 app.use(express.json({ type: '*/*' })); // accept Square's JSON
@@ -10,17 +11,12 @@ app.use(express.json({ type: '*/*' })); // accept Square's JSON
 const {
   SQUARE_ACCESS_TOKEN,
   SQUARE_API_VERSION = '2025-03-19',
-  ICLOUD_USERNAME,
-  ICLOUD_APP_PASSWORD,
+  ICLOUD_USERNAME,             // Apple ID email
+  ICLOUD_APP_PASSWORD,         // App-specific password from Apple
   ICLOUD_CALENDAR_NAME = 'Lil’s Bookings'
 } = process.env;
 
-const required = [
-  'SQUARE_ACCESS_TOKEN',
-  'SQUARE_API_VERSION',
-  'ICLOUD_USERNAME',
-  'ICLOUD_APP_PASSWORD'
-];
+const required = ['SQUARE_ACCESS_TOKEN','SQUARE_API_VERSION','ICLOUD_USERNAME','ICLOUD_APP_PASSWORD'];
 console.log('[ENV] Loaded:', required.map(k => `${k}=${process.env[k] ? '✓' : '✗'}`).join('  '));
 
 // ---- Square helpers ----
@@ -60,7 +56,87 @@ async function fetchCustomer(customerId) {
   return body.customer;
 }
 
-// ---- Event builder ----
+// ---- ICS helpers (inline build) ----
+function toICSDate(iso) {
+  const d = new Date(iso);
+  const pad = (n) => String(n).padStart(2, '0');
+  return (
+    d.getUTCFullYear().toString() +
+    pad(d.getUTCMonth() + 1) +
+    pad(d.getUTCDate()) + 'T' +
+    pad(d.getUTCHours()) +
+    pad(d.getUTCMinutes()) +
+    pad(d.getUTCSeconds()) + 'Z'
+  );
+}
+function icsEscape(s = '') {
+  return String(s).replace(/\\/g,'\\\\').replace(/;/g,'\\;').replace(/,/g,'\\,').replace(/\r?\n/g,'\\n');
+}
+function buildICS({ uid, summary, location, description, start, end }) {
+  const now = toICSDate(new Date().toISOString());
+  const dtStart = toICSDate(start);
+  const dtEnd = toICSDate(end);
+  return [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Lils Ice Cream//Bookings//EN',
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    'BEGIN:VEVENT',
+    `UID:${icsEscape(uid)}`,
+    `DTSTAMP:${now}`,
+    `DTSTART:${dtStart}`,
+    `DTEND:${dtEnd}`,
+    `SUMMARY:${icsEscape(summary)}`,
+    `LOCATION:${icsEscape(location)}`,
+    `DESCRIPTION:${icsEscape(description)}`,
+    'END:VEVENT',
+    'END:VCALENDAR',
+    ''
+  ].join('\r\n');
+}
+
+// ---- iCloud CalDAV helpers ----
+async function getIcloudCalendar() {
+  const client = new DAVClient({
+    serverUrl: 'https://caldav.icloud.com',
+    credentials: { username: ICLOUD_USERNAME, password: ICLOUD_APP_PASSWORD },
+    authMethod: 'Basic',
+    defaultAccountType: 'caldav'
+  });
+  await client.login();
+  const calendars = await fetchCalendars({ client });
+  if (!calendars?.length) throw new Error('No iCloud calendars found');
+
+  // Exact match on display name (fallback to first)
+  const target = calendars.find(c => (c.displayName || '').trim() === ICLOUD_CALENDAR_NAME.trim()) || calendars[0];
+  return { client, calendar: target };
+}
+
+async function upsertIcloudEvent({ uid, ics }) {
+  const { client, calendar } = await getIcloudCalendar();
+  const filename = `${uid}.ics`;
+
+  // See if it exists already
+  const objects = await fetchCalendarObjects({ client, calendar });
+  const existing = objects.find(o => (o.url || o.href || '').endsWith(`/${filename}`));
+
+  if (!existing) {
+    // Create new
+    await createObject({ client, calendar, filename, iCalString: ics });
+    console.log(`Created iCloud event: ${filename}`);
+  } else {
+    // Update existing using ETag
+    await updateObject({
+      client,
+      calendarObject: existing,
+      iCalString: ics
+    });
+    console.log(`Updated iCloud event: ${filename}`);
+  }
+}
+
+// ---- Booking -> Calendar
 async function processBooking(bookingId) {
   const booking = await fetchBooking(bookingId);
   const startISO = booking.start_at;
@@ -80,17 +156,20 @@ async function processBooking(bookingId) {
   }
 
   const fullName = `${first} ${last}`.trim() || 'Customer';
-  const event = {
-    summary: `Truck Event – ${fullName}`,
-    location: addressLine,
-    start: startISO,
-    end: endISO,
-    description: `Square: https://squareup.com/dashboard/appointments (Booking ID: ${booking.id})`
-  };
+  const summary = `Truck Event – ${fullName}`;
+  const description = `Square: https://squareup.com/dashboard/appointments (Booking ID: ${booking.id})`;
+  const uid = `${booking.id}@lilsicecream`;
 
-  // TODO: push to iCloud here (CalDAV). For now, just log so we can verify end-to-end.
-  console.log('Event built:', event);
-  return event;
+  const ics = buildICS({
+    uid,
+    summary,
+    location: addressLine,
+    description,
+    start: startISO,
+    end: endISO
+  });
+
+  await upsertIcloudEvent({ uid, ics });
 }
 
 // ---- Routes ----
@@ -98,28 +177,24 @@ app.get('/health', (_req, res) => res.send('ok'));
 
 app.post('/webhooks/square', async (req, res) => {
   try {
-    console.log('--- Incoming Square Webhook ---');
-    console.log('Type:', req.body?.type);
+    const eventType = req.body?.type || 'unknown';
     const bookingId =
       req.body?.data?.object?.booking?.id ||
-      req.body?.data?.id; // fallback if structure varies
+      req.body?.data?.id; // fallback if Square payload differs
 
-    if (!bookingId) {
-      console.warn('No booking ID found in webhook payload');
-      return res.sendStatus(200);
+    console.log('Square webhook:', eventType, 'bookingId:', bookingId || '(none)');
+
+    if (bookingId && /booking\.(created|updated)/i.test(eventType)) {
+      await processBooking(bookingId);
     }
-
-    await processBooking(bookingId);
+    // Return 200 to avoid retries; if you want auto-retry on transient errors, return 500 when failing.
     res.sendStatus(200);
   } catch (err) {
-    console.error('Webhook error:', err);
-    // return 200 while debugging to avoid Square retry storms
+    console.error('Webhook error:', err?.response?.body || err);
     res.sendStatus(200);
   }
 });
 
 // ---- Start ----
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
