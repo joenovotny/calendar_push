@@ -131,6 +131,12 @@ async function getIcloudCalendar() {
 
 function ensureAbsoluteUrl(u) {
   if (!u) return null;
+  // If it's an object (some tsdav versions), try .href or .toString()
+  if (typeof u === 'object') {
+    if (typeof u.href === 'string') u = u.href;
+    else u = String(u);
+  }
+  // Make it absolute
   return /^https?:\/\//i.test(u) ? u : `https://caldav.icloud.com${u}`;
 }
 
@@ -138,26 +144,34 @@ async function upsertIcloudEvent({ uid, ics }) {
   const { client, calendar } = await getIcloudCalendar();
   const filename = `${uid}.ics`;
 
-  // Normalize calendar url to absolute
-  const calUrl = ensureAbsoluteUrl(calendar.url || calendar.href);
-  const calForOps = { ...calendar, url: calUrl };
+  // Normalize calendar URL to a plain absolute string
+  let rawCalUrl = calendar.url ?? calendar.href ?? calendar?.url?.href;
+  const calUrl = ensureAbsoluteUrl(rawCalUrl);
+  if (!calUrl) {
+    throw new Error('iCloud calendar URL missing; cannot create/update event.');
+  }
+
+  // Use a minimal calendar descriptor with a clean absolute url
+  const cal = { url: calUrl };
 
   // List existing objects
-  const objects = await fetchCalendarObjects({ client, calendar: calForOps });
+  const objects = await fetchCalendarObjects({ client, calendar: cal });
 
-  // Their hrefs/urls can be relative too; compare by filename
+  // Compare by filename; normalize each object URL too
   const existing = (objects || []).find(o => {
-    const objUrl = ensureAbsoluteUrl(o.url || o.href);
+    const objRaw = o.url ?? o.href ?? o?.url?.href;
+    const objUrl = ensureAbsoluteUrl(objRaw);
     return objUrl && objUrl.endsWith(`/${filename}`);
   });
 
   if (!existing) {
-    await createObject({ client, calendar: calForOps, filename, iCalString: ics });
+    await createObject({ client, calendar: cal, filename, iCalString: ics });
     console.log(`Created iCloud event: ${filename}`);
   } else {
+    const existingUrl = ensureAbsoluteUrl(existing.url ?? existing.href ?? existing?.url?.href);
     await updateObject({
       client,
-      calendarObject: { ...existing, url: ensureAbsoluteUrl(existing.url || existing.href) },
+      calendarObject: { ...existing, url: existingUrl },
       iCalString: ics
     });
     console.log(`Updated iCloud event: ${filename}`);
