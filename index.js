@@ -155,19 +155,25 @@ async function processBooking(bookingId, { shouldEmail }) {
   const durMin = booking.appointment_segments?.[0]?.duration_minutes ?? 60;
   const endISO = dayjs(startISO).add(durMin, 'minute').toISOString();
 
-  let first = '', last = '', addressLine = 'TBD';
+  let first = '', last = '', addressLine = 'TBD', phone = '';
   if (booking.customer_id) {
     try {
       const customer = await fetchCustomer(booking.customer_id);
       first = customer.given_name || '';
       last  = customer.family_name || '';
       addressLine = formatAddress(customer.address) || 'TBD';
+      phone = customer.phone_number || '';
     } catch (e) { console.warn('Customer lookup failed:', e); }
   }
 
   const fullName = `${first} ${last}`.trim() || 'Customer';
   const summary = `Truck Event – ${fullName}`;
-  const description = `Square: https://squareup.com/dashboard/appointments (Booking ID: ${booking.id})`;
+  const descriptionLines = [
+    `Square: https://squareup.com/dashboard/appointments (Booking ID: ${booking.id})`,
+    phone ? `Phone: ${phone}` : null
+  ].filter(Boolean);
+  const description = descriptionLines.join('\n');
+
   const uid = `${booking.id}@lilsicecream`;
   const ics = buildICS({ uid, summary, location: addressLine, description, start: startISO, end: endISO });
 
@@ -189,7 +195,6 @@ const DEDUPE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 function isDuplicate(eventId) {
   if (!eventId) return false;
   const now = Date.now();
-  // cleanup old
   for (const [k, v] of seen) if (v < now) seen.delete(k);
   if (seen.has(eventId)) return true;
   seen.set(eventId, now + DEDUPE_TTL_MS);
@@ -201,48 +206,30 @@ app.get('/health', (_req, res) => res.send('ok'));
 
 app.post('/webhooks/square', async (req, res) => {
   try {
-    const eventType =
-      req.body?.type ||
-      req.body?.event_type ||
-      'unknown';
-
-    // Square sends an event id; try multiple shapes just in case
-    const eventId =
-      req.body?.event_id ||
-      req.body?.id ||
-      req.headers['x-square-signature'] || // last resort (not ideal)
-      null;
-
-    const bookingId =
-      req.body?.data?.object?.booking?.id ||
-      req.body?.data?.id ||
-      null;
+    const eventType = req.body?.type || req.body?.event_type || 'unknown';
+    const eventId   = req.body?.event_id || req.body?.id || null;
+    const bookingId = req.body?.data?.object?.booking?.id || req.body?.data?.id || null;
 
     console.log('Square webhook:', { eventType, eventId, bookingId });
 
-    // Drop dup deliveries
     if (isDuplicate(eventId)) {
       console.log('Duplicate webhook suppressed:', eventId);
       return res.sendStatus(200);
     }
-
-    // Skip fake IDs from Send Test Event
     if (!bookingId || String(bookingId).startsWith('TEST')) {
       return res.sendStatus(200);
     }
 
-    // Decide whether to email
     const shouldEmail = eventType === 'booking.created' ||
-                        (eventType === 'booking.updated' && SEND_EMAIL_ON_UPDATED.toLowerCase() === 'true');
+      (eventType === 'booking.updated' && SEND_EMAIL_ON_UPDATED.toLowerCase() === 'true');
 
     if (/^booking\.(created|updated)$/i.test(eventType)) {
       await processBooking(bookingId, { shouldEmail });
     }
-
     res.sendStatus(200);
   } catch (err) {
     console.error('Webhook error:', err?.response?.body || err);
-    res.sendStatus(200); // avoid Square retry storms
+    res.sendStatus(200);
   }
 });
 
