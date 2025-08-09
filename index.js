@@ -107,13 +107,19 @@ async function getIcloudCalendar() {
 
   await client.login();
 
-  // fetch calendars using current tsdav pattern
-  const calendars = await fetchCalendars({ client });
+  // ✅ REQUIRED: initialize a CalDAV account on the client
+  await client.createAccount({
+    account: {
+      serverUrl: 'https://caldav.icloud.com',
+      accountType: 'caldav',
+      rootUrl: 'https://caldav.icloud.com'
+    }
+  });
 
+  // Now you can fetch calendars from the initialized account
+  const calendars = await client.fetchCalendars();
   if (!calendars || calendars.length === 0) {
-    throw new Error(
-      'Could not fetch iCloud calendars. Verify ICLOUD_USERNAME / ICLOUD_APP_PASSWORD and that Calendar is enabled for this Apple ID.'
-    );
+    throw new Error('Could not fetch iCloud calendars. Check ICLOUD_USERNAME / ICLOUD_APP_PASSWORD and that Calendar is enabled.');
   }
 
   const target =
