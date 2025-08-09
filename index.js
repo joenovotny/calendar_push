@@ -261,17 +261,26 @@ function isDuplicate(eventId) {
 }
 
 async function processBookingRouter(bookingId, { shouldEmail }) {
-  // Always fetch so we can see current status
   const booking = await fetchBooking(bookingId);
-  const status = (booking.status || booking.booking_status || '').toUpperCase();
 
-  // Treat these as cancelled
-  const isCancelled = status === 'CANCELLED' || status === 'CANCELED' || status === 'NO_SHOW';
+  const statusRaw = booking.status || booking.booking_status || '';
+  const status = String(statusRaw).toUpperCase();
+  const canceledAt = booking.canceled_at || booking.cancelled_at || null;
+  const cancelReason = booking.cancellation_reason || null;
+
+  console.log('[Booking status]', { bookingId, status, canceledAt, cancelReason });
+
+  const isCancelled =
+    status.includes('CANCEL') ||        // CANCELLED / CANCELED
+    status === 'NO_SHOW' ||
+    !!canceledAt ||
+    !!cancelReason;
 
   if (isCancelled) {
-    await processCancellation(bookingId, { shouldEmail: String(process.env.SEND_EMAIL_ON_CANCELED || 'true').toLowerCase() === 'true' });
+    await processCancellation(bookingId, {
+      shouldEmail: String(process.env.SEND_EMAIL_ON_CANCELED || 'true').toLowerCase() === 'true'
+    });
   } else {
-    // Reuse your existing processBooking flow (it also fetches details again; that's fine)
     await processBooking(bookingId, { shouldEmail });
   }
 }
@@ -307,6 +316,17 @@ app.post('/webhooks/square', async (req, res) => {
   } catch (err) {
     console.error('Webhook error:', err?.response?.body || err);
     res.sendStatus(200);
+  }
+});
+
+app.post('/debug/delete/:bookingId', async (req, res) => {
+  try {
+    const uid = `${req.params.bookingId}@lilsicecream`;
+    await deleteIcloudEvent({ uid });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('Manual delete failed:', e);
+    return res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
