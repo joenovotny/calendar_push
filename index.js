@@ -1,13 +1,12 @@
 // index.js
 require('dotenv/config');
 const express = require('express');
-const fetch = require('node-fetch');
 const dayjs = require('dayjs');
-const ical = require('ical-generator');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ type: '*/*' })); // accept Square's JSON
 
+// ---- ENV ----
 const {
   SQUARE_ACCESS_TOKEN,
   SQUARE_API_VERSION = '2025-03-19',
@@ -16,22 +15,15 @@ const {
   ICLOUD_CALENDAR_NAME = 'Lil’s Bookings'
 } = process.env;
 
-// ---- ENV check ----
 const required = [
   'SQUARE_ACCESS_TOKEN',
   'SQUARE_API_VERSION',
   'ICLOUD_USERNAME',
   'ICLOUD_APP_PASSWORD'
 ];
-for (const k of required) {
-  if (!process.env[k]) {
-    console.warn(`[ENV] Missing ${k}`);
-  }
-}
-console.log('[ENV] Loaded:',
-  required.map(k => `${k}=${process.env[k] ? '✓' : '✗'}`).join('  ')
-);
+console.log('[ENV] Loaded:', required.map(k => `${k}=${process.env[k] ? '✓' : '✗'}`).join('  '));
 
+// ---- Square helpers ----
 const BASE = 'https://connect.squareup.com/v2';
 function authHeaders() {
   return {
@@ -40,7 +32,10 @@ function authHeaders() {
     'Content-Type': 'application/json'
   };
 }
-
+async function getJson(res) {
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return text; }
+}
 function formatAddress(addr) {
   if (!addr) return '';
   const parts = [
@@ -52,19 +47,12 @@ function formatAddress(addr) {
   ].filter(Boolean);
   return parts.join(', ');
 }
-
-async function getJson(res) {
-  const text = await res.text();
-  try { return JSON.parse(text); } catch { return text; }
-}
-
 async function fetchBooking(bookingId) {
   const res = await fetch(`${BASE}/bookings/${bookingId}`, { headers: authHeaders() });
   const body = await getJson(res);
   if (!res.ok) throw body;
   return body.booking;
 }
-
 async function fetchCustomer(customerId) {
   const res = await fetch(`${BASE}/customers/${customerId}`, { headers: authHeaders() });
   const body = await getJson(res);
@@ -72,13 +60,7 @@ async function fetchCustomer(customerId) {
   return body.customer;
 }
 
-// Create calendar event (replace this with actual iCloud push)
-async function createCalendarEvent(event) {
-  // This is where you integrate with iCloud Calendar via CalDAV or another library.
-  // For now, we'll just log.
-  console.log('Creating calendar event:', event);
-}
-
+// ---- Event builder ----
 async function processBooking(bookingId) {
   const booking = await fetchBooking(bookingId);
   const startISO = booking.start_at;
@@ -90,7 +72,7 @@ async function processBooking(bookingId) {
     try {
       const customer = await fetchCustomer(booking.customer_id);
       first = customer.given_name || '';
-      last = customer.family_name || '';
+      last  = customer.family_name || '';
       addressLine = formatAddress(customer.address) || 'TBD';
     } catch (e) {
       console.warn('Customer lookup failed:', e);
@@ -103,41 +85,40 @@ async function processBooking(bookingId) {
     location: addressLine,
     start: startISO,
     end: endISO,
-    description: `Square Booking Link: https://squareup.com/dashboard/appointments/booking/${booking.id}`
+    description: `Square: https://squareup.com/dashboard/appointments (Booking ID: ${booking.id})`
   };
 
-  await createCalendarEvent(event);
+  // TODO: push to iCloud here (CalDAV). For now, just log so we can verify end-to-end.
+  console.log('Event built:', event);
+  return event;
 }
 
 // ---- Routes ----
-app.get('/health', (_req, res) => {
-  res.send('ok');
-});
+app.get('/health', (_req, res) => res.send('ok'));
 
 app.post('/webhooks/square', async (req, res) => {
-  console.log('--- Incoming Square Webhook ---');
-  console.log('Headers:', req.headers);
-  console.log('Body:', JSON.stringify(req.body, null, 2));
-
   try {
-    const eventType = req.body?.type || 'unknown';
-    if (eventType.includes('booking')) {
-      const bookingId = req.body?.data?.object?.booking?.id;
-      if (bookingId) {
-        console.log(`Processing booking ID: ${bookingId}`);
-        await processBooking(bookingId);
-      } else {
-        console.warn('No booking ID found in webhook payload');
-      }
+    console.log('--- Incoming Square Webhook ---');
+    console.log('Type:', req.body?.type);
+    const bookingId =
+      req.body?.data?.object?.booking?.id ||
+      req.body?.data?.id; // fallback if structure varies
+
+    if (!bookingId) {
+      console.warn('No booking ID found in webhook payload');
+      return res.sendStatus(200);
     }
-    res.status(200).send('ok');
+
+    await processBooking(bookingId);
+    res.sendStatus(200);
   } catch (err) {
     console.error('Webhook error:', err);
-    res.status(500).send('error');
+    // return 200 while debugging to avoid Square retry storms
+    res.sendStatus(200);
   }
 });
 
-// ---- Start server ----
+// ---- Start ----
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
