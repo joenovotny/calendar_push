@@ -148,6 +148,32 @@ async function upsertIcloudEvent({ uid, ics }) {
   console.log(`${etag ? 'Upserted' : 'Created'} iCloud event: ${filename}`);
 }
 
+async function deleteIcloudEvent({ uid }) {
+  const { calendar } = await getIcloudCalendar();
+  const rawCalUrl = calendar.url ?? calendar.href ?? calendar?.url?.href;
+  const calUrl = ensureAbsoluteUrl(rawCalUrl);
+  if (!calUrl) throw new Error('iCloud calendar URL missing.');
+
+  const filename = `${uid}.ics`;
+  const eventUrl = new URL(filename, calUrl).toString();
+  const auth = Buffer.from(`${ICLOUD_USERNAME}:${ICLOUD_APP_PASSWORD}`).toString('base64');
+
+  const res = await fetch(eventUrl, {
+    method: 'DELETE',
+    headers: { 'Authorization': `Basic ${auth}` }
+  });
+
+  if (res.status === 404) {
+    console.log(`Cancellation: event not found (already gone): ${filename}`);
+    return;
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`CalDAV DELETE failed ${res.status}: ${text || res.statusText}`);
+  }
+  console.log(`Deleted iCloud event: ${filename}`);
+}
+
 // ---- Booking -> Calendar
 async function processBooking(bookingId, { shouldEmail }) {
   const booking = await fetchBooking(bookingId);
@@ -189,6 +215,39 @@ async function processBooking(bookingId, { shouldEmail }) {
   await upsertIcloudEvent({ uid, ics });
 }
 
+async function processCancellation(bookingId, { shouldEmail }) {
+  const uid = `${bookingId}@lilsicecream`;
+
+  // (Optional) try to fetch name/phone for nicer email; ignore errors
+  let summary = `Truck Event – Canceled`;
+  try {
+    const booking = await fetchBooking(bookingId);
+    let first = '', last = '';
+    if (booking.customer_id) {
+      try {
+        const customer = await fetchCustomer(booking.customer_id);
+        first = customer.given_name || '';
+        last  = customer.family_name || '';
+      } catch {}
+    }
+    const fullName = `${first} ${last}`.trim();
+    if (fullName) summary = `Truck Event – ${fullName} (Canceled)`;
+  } catch {}
+
+  if (shouldEmail) {
+    await sendIcsEmail({
+      to: TO_EMAIL,
+      subject: summary,
+      text: `Booking ${bookingId}\nStatus: CANCELED`,
+      ics: 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n',
+      filename: `${uid}.ics`
+    });
+  }
+
+  await deleteIcloudEvent({ uid });
+}
+
+
 // ---- Webhook de-dupe (memory TTL) ----
 const seen = new Map(); // eventId -> expiresAt
 const DEDUPE_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -220,12 +279,20 @@ app.post('/webhooks/square', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const shouldEmail = eventType === 'booking.created' ||
-      (eventType === 'booking.updated' && SEND_EMAIL_ON_UPDATED.toLowerCase() === 'true');
+    if (eventType === 'booking.canceled') {
+      const shouldEmailCancel = String(process.env.SEND_EMAIL_ON_CANCELED || 'true').toLowerCase() === 'true';
+      await processCancellation(bookingId, { shouldEmail: shouldEmailCancel });
+      return res.sendStatus(200);
+    }
+
+    const shouldEmail =
+      eventType === 'booking.created' ||
+      (eventType === 'booking.updated' && (process.env.SEND_EMAIL_ON_UPDATED || 'false').toLowerCase() === 'true');
 
     if (/^booking\.(created|updated)$/i.test(eventType)) {
       await processBooking(bookingId, { shouldEmail });
     }
+
     res.sendStatus(200);
   } catch (err) {
     console.error('Webhook error:', err?.response?.body || err);
