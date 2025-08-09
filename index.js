@@ -3,6 +3,7 @@ require('dotenv/config');
 const express = require('express');
 const dayjs = require('dayjs');
 const { DAVClient, fetchCalendars, fetchCalendarObjects, createObject, updateObject } = require('tsdav');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json({ type: '*/*' })); // accept Square's JSON
@@ -94,6 +95,31 @@ function buildICS({ uid, summary, location, description, start, end }) {
     'END:VCALENDAR',
     ''
   ].join('\r\n');
+}
+
+async function sendIcsEmail({ to, subject, text, ics, filename }) {
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: false,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
+  });
+
+  await transporter.sendMail({
+    from: process.env.SMTP_USER,
+    to,
+    subject,
+    text,
+    attachments: [{
+      filename: filename || 'event.ics',
+      content: ics,
+      contentType: 'text/calendar; method=PUBLISH; charset=UTF-8'
+    }]
+  });
+  console.log(`Emailed ICS to ${to}`);
 }
 
 // ---- iCloud CalDAV helpers ----
@@ -210,6 +236,17 @@ async function processBooking(bookingId) {
     start: startISO,
     end: endISO
   });
+
+  const filename = `${uid}.ics`;
+
+// email to you (or to customer if you want)
+await sendIcsEmail({
+  to: process.env.TO_EMAIL,
+  subject: summary,
+  text: `Booking ${booking.id}\n${description}\nLocation: ${addressLine}\nStart: ${startISO}\nEnd: ${endISO}`,
+  ics,
+  filename
+});
 
   await upsertIcloudEvent({ uid, ics });
 }
