@@ -129,21 +129,35 @@ async function getIcloudCalendar() {
   return { client, calendar: target };
 }
 
+function ensureAbsoluteUrl(u) {
+  if (!u) return null;
+  return /^https?:\/\//i.test(u) ? u : `https://caldav.icloud.com${u}`;
+}
+
 async function upsertIcloudEvent({ uid, ics }) {
   const { client, calendar } = await getIcloudCalendar();
   const filename = `${uid}.ics`;
 
-  // See if it exists already
-  const objects = await fetchCalendarObjects({ client, calendar });
-  const existing = objects.find(o => (o.url || o.href || '').endsWith(`/${filename}`));
+  // Normalize calendar url to absolute
+  const calUrl = ensureAbsoluteUrl(calendar.url || calendar.href);
+  const calForOps = { ...calendar, url: calUrl };
+
+  // List existing objects
+  const objects = await fetchCalendarObjects({ client, calendar: calForOps });
+
+  // Their hrefs/urls can be relative too; compare by filename
+  const existing = (objects || []).find(o => {
+    const objUrl = ensureAbsoluteUrl(o.url || o.href);
+    return objUrl && objUrl.endsWith(`/${filename}`);
+  });
 
   if (!existing) {
-    await createObject({ client, calendar, filename, iCalString: ics });
+    await createObject({ client, calendar: calForOps, filename, iCalString: ics });
     console.log(`Created iCloud event: ${filename}`);
   } else {
     await updateObject({
       client,
-      calendarObject: existing,
+      calendarObject: { ...existing, url: ensureAbsoluteUrl(existing.url || existing.href) },
       iCalString: ics
     });
     console.log(`Updated iCloud event: ${filename}`);
