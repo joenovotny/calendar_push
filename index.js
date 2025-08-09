@@ -56,7 +56,7 @@ async function fetchCustomer(customerId) {
   return body.customer;
 }
 
-// ---- ICS helpers (inline build) ----
+// ---- ICS helpers ----
 function toICSDate(iso) {
   const d = new Date(iso);
   const pad = (n) => String(n).padStart(2, '0');
@@ -98,7 +98,6 @@ function buildICS({ uid, summary, location, description, start, end }) {
 
 // ---- iCloud CalDAV helpers ----
 async function getIcloudCalendar() {
-  const { DAVClient, fetchCalendars } = require('tsdav');
   const client = new DAVClient({
     serverUrl: 'https://caldav.icloud.com',
     credentials: { username: ICLOUD_USERNAME, password: ICLOUD_APP_PASSWORD },
@@ -106,24 +105,19 @@ async function getIcloudCalendar() {
     defaultAccountType: 'caldav'
   });
 
-  // IMPORTANT: do discovery before listing calendars
   await client.login();
-  await client.fetchPrincipalUrl(); // <--
-  await client.fetchHomeUrl();      // <--
 
-  const calendars = await fetchCalendars({
-    client,
-    account: client.account        // <--
-  });
+  // fetch calendars using current tsdav pattern
+  const calendars = await fetchCalendars({ client });
 
-  if (!calendars?.length) {
+  if (!calendars || calendars.length === 0) {
     throw new Error(
       'Could not fetch iCloud calendars. Verify ICLOUD_USERNAME / ICLOUD_APP_PASSWORD and that Calendar is enabled for this Apple ID.'
     );
   }
 
   const target =
-    calendars.find(c => (c.displayName || '').trim() === ICLOUD_CALENDAR_NAME.trim()) ||
+    calendars.find(c => (c.displayName || '').trim() === (ICLOUD_CALENDAR_NAME || '').trim()) ||
     calendars[0];
 
   return { client, calendar: target };
@@ -138,11 +132,9 @@ async function upsertIcloudEvent({ uid, ics }) {
   const existing = objects.find(o => (o.url || o.href || '').endsWith(`/${filename}`));
 
   if (!existing) {
-    // Create new
     await createObject({ client, calendar, filename, iCalString: ics });
     console.log(`Created iCloud event: ${filename}`);
   } else {
-    // Update existing using ETag
     await updateObject({
       client,
       calendarObject: existing,
@@ -191,6 +183,23 @@ async function processBooking(bookingId) {
 // ---- Routes ----
 app.get('/health', (_req, res) => res.send('ok'));
 
+// (optional) list calendars to confirm the name; remove after testing
+app.get('/debug/caldav', async (_req, res) => {
+  try {
+    const client = new DAVClient({
+      serverUrl: 'https://caldav.icloud.com',
+      credentials: { username: ICLOUD_USERNAME, password: ICLOUD_APP_PASSWORD },
+      authMethod: 'Basic',
+      defaultAccountType: 'caldav'
+    });
+    await client.login();
+    const calendars = await fetchCalendars({ client });
+    res.json({ calendars: (calendars || []).map(c => c.displayName || '(no name)') });
+  } catch (e) {
+    res.status(500).send('CalDAV login failed. Check ICLOUD_USERNAME / ICLOUD_APP_PASSWORD and that Calendar is enabled.');
+  }
+});
+
 app.post('/webhooks/square', async (req, res) => {
   try {
     const eventType = req.body?.type || 'unknown';
@@ -200,10 +209,14 @@ app.post('/webhooks/square', async (req, res) => {
 
     console.log('Square webhook:', eventType, 'bookingId:', bookingId || '(none)');
 
-    if (bookingId && /booking\.(created|updated)/i.test(eventType)) {
+    // Skip obviously fake IDs from Square "Send Test Event"
+    if (!bookingId || String(bookingId).startsWith('TEST')) {
+      return res.sendStatus(200);
+    }
+
+    if (/booking\.(created|updated)/i.test(eventType)) {
       await processBooking(bookingId);
     }
-    // Return 200 to avoid retries; if you want auto-retry on transient errors, return 500 when failing.
     res.sendStatus(200);
   } catch (err) {
     console.error('Webhook error:', err?.response?.body || err);
