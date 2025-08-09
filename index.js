@@ -98,18 +98,34 @@ function buildICS({ uid, summary, location, description, start, end }) {
 
 // ---- iCloud CalDAV helpers ----
 async function getIcloudCalendar() {
+  const { DAVClient, fetchCalendars } = require('tsdav');
   const client = new DAVClient({
     serverUrl: 'https://caldav.icloud.com',
     credentials: { username: ICLOUD_USERNAME, password: ICLOUD_APP_PASSWORD },
     authMethod: 'Basic',
     defaultAccountType: 'caldav'
   });
-  await client.login();
-  const calendars = await fetchCalendars({ client });
-  if (!calendars?.length) throw new Error('No iCloud calendars found');
 
-  // Exact match on display name (fallback to first)
-  const target = calendars.find(c => (c.displayName || '').trim() === ICLOUD_CALENDAR_NAME.trim()) || calendars[0];
+  // IMPORTANT: do discovery before listing calendars
+  await client.login();
+  await client.fetchPrincipalUrl(); // <--
+  await client.fetchHomeUrl();      // <--
+
+  const calendars = await fetchCalendars({
+    client,
+    account: client.account        // <--
+  });
+
+  if (!calendars?.length) {
+    throw new Error(
+      'Could not fetch iCloud calendars. Verify ICLOUD_USERNAME / ICLOUD_APP_PASSWORD and that Calendar is enabled for this Apple ID.'
+    );
+  }
+
+  const target =
+    calendars.find(c => (c.displayName || '').trim() === ICLOUD_CALENDAR_NAME.trim()) ||
+    calendars[0];
+
   return { client, calendar: target };
 }
 
