@@ -157,51 +157,42 @@ async function getIcloudCalendar() {
 
 function ensureAbsoluteUrl(u) {
   if (!u) return null;
-  // If it's an object (some tsdav versions), try .href or .toString()
-  if (typeof u === 'object') {
-    if (typeof u.href === 'string') u = u.href;
-    else u = String(u);
-  }
-  // Make it absolute
+  if (typeof u === 'object') u = u.href || String(u);
   return /^https?:\/\//i.test(u) ? u : `https://caldav.icloud.com${u}`;
 }
 
-async function upsertIcloudEvent({ uid, ics }) {
-  const { client, calendar } = await getIcloudCalendar();
-  const filename = `${uid}.ics`;
+async function putIcsToIcloud({ calUrl, filename, ics }) {
+  const eventUrl = new URL(filename, calUrl).toString(); // absolute
+  const auth = Buffer.from(`${process.env.ICLOUD_USERNAME}:${process.env.ICLOUD_APP_PASSWORD}`).toString('base64');
 
-  // Normalize calendar URL to a plain absolute string
-  let rawCalUrl = calendar.url ?? calendar.href ?? calendar?.url?.href;
-  const calUrl = ensureAbsoluteUrl(rawCalUrl);
-  if (!calUrl) {
-    throw new Error('iCloud calendar URL missing; cannot create/update event.');
-  }
-
-  // Use a minimal calendar descriptor with a clean absolute url
-  const cal = { url: calUrl };
-
-  // List existing objects
-  const objects = await fetchCalendarObjects({ client, calendar: cal });
-
-  // Compare by filename; normalize each object URL too
-  const existing = (objects || []).find(o => {
-    const objRaw = o.url ?? o.href ?? o?.url?.href;
-    const objUrl = ensureAbsoluteUrl(objRaw);
-    return objUrl && objUrl.endsWith(`/${filename}`);
+  const res = await fetch(eventUrl, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'text/calendar; charset=utf-8'
+      // Optional: add 'If-None-Match': '*' to prevent overwrite, or 'If-Match' with ETag if you want strict updates
+    },
+    body: ics
   });
 
-  if (!existing) {
-    await createObject({ client, calendar: cal, filename, iCalString: ics });
-    console.log(`Created iCloud event: ${filename}`);
-  } else {
-    const existingUrl = ensureAbsoluteUrl(existing.url ?? existing.href ?? existing?.url?.href);
-    await updateObject({
-      client,
-      calendarObject: { ...existing, url: existingUrl },
-      iCalString: ics
-    });
-    console.log(`Updated iCloud event: ${filename}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`CalDAV PUT failed ${res.status}: ${text || res.statusText}`);
   }
+  return res.headers.get('etag') || null;
+}
+
+async function upsertIcloudEvent({ uid, ics }) {
+  const { calendar } = await getIcloudCalendar();
+
+  // normalize calendar base URL to absolute
+  const rawCalUrl = calendar.url ?? calendar.href ?? calendar?.url?.href;
+  const calUrl = ensureAbsoluteUrl(rawCalUrl);
+  if (!calUrl) throw new Error('iCloud calendar URL missing; cannot create/update event.');
+
+  const filename = `${uid}.ics`;
+  const etag = await putIcsToIcloud({ calUrl, filename, ics });
+  console.log(`${etag ? 'Upserted' : 'Created'} iCloud event: ${filename}`);
 }
 
 // ---- Booking -> Calendar
