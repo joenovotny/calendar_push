@@ -2,7 +2,7 @@
 require('dotenv/config');
 const express = require('express');
 const dayjs = require('dayjs');
-const { DAVClient, fetchCalendars, fetchCalendarObjects, createObject, updateObject } = require('tsdav');
+const { DAVClient, fetchCalendars } = require('tsdav');
 const nodemailer = require('nodemailer');
 
 const app = express();
@@ -12,13 +12,19 @@ app.use(express.json({ type: '*/*' })); // accept Square's JSON
 const {
   SQUARE_ACCESS_TOKEN,
   SQUARE_API_VERSION = '2025-03-19',
-  ICLOUD_USERNAME,             // Apple ID email
-  ICLOUD_APP_PASSWORD,         // App-specific password from Apple
-  ICLOUD_CALENDAR_NAME = 'Lil’s Bookings'
+  ICLOUD_USERNAME,
+  ICLOUD_APP_PASSWORD,
+  ICLOUD_CALENDAR_NAME = 'Lil’s Bookings',
+  SMTP_HOST,
+  SMTP_PORT = '587',
+  SMTP_USER,
+  SMTP_PASS,
+  TO_EMAIL,
+  FROM_EMAIL,
+  SEND_EMAIL_ON_UPDATED = 'false' // set to 'true' to also email on updates
 } = process.env;
 
-const required = ['SQUARE_ACCESS_TOKEN','SQUARE_API_VERSION','ICLOUD_USERNAME','ICLOUD_APP_PASSWORD'];
-console.log('[ENV] Loaded:', required.map(k => `${k}=${process.env[k] ? '✓' : '✗'}`).join('  '));
+console.log('[ENV] Loaded: SQUARE_ACCESS_TOKEN=✓  SQUARE_API_VERSION=✓  ICLOUD_USERNAME=✓  ICLOUD_APP_PASSWORD=✓');
 
 // ---- Square helpers ----
 const BASE = 'https://connect.squareup.com/v2';
@@ -36,11 +42,8 @@ async function getJson(res) {
 function formatAddress(addr) {
   if (!addr) return '';
   const parts = [
-    addr.address_line_1,
-    addr.locality,
-    addr.administrative_district_level_1,
-    addr.postal_code,
-    addr.country
+    addr.address_line_1, addr.locality,
+    addr.administrative_district_level_1, addr.postal_code, addr.country
   ].filter(Boolean);
   return parts.join(', ');
 }
@@ -60,17 +63,10 @@ async function fetchCustomer(customerId) {
 // ---- ICS helpers ----
 function toICSDate(iso) {
   const d = new Date(iso);
-  const pad = (n) => String(n).padStart(2, '0');
-  return (
-    d.getUTCFullYear().toString() +
-    pad(d.getUTCMonth() + 1) +
-    pad(d.getUTCDate()) + 'T' +
-    pad(d.getUTCHours()) +
-    pad(d.getUTCMinutes()) +
-    pad(d.getUTCSeconds()) + 'Z'
-  );
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
 }
-function icsEscape(s = '') {
+function icsEscape(s='') {
   return String(s).replace(/\\/g,'\\\\').replace(/;/g,'\\;').replace(/,/g,'\\,').replace(/\r?\n/g,'\\n');
 }
 function buildICS({ uid, summary, location, description, start, end }) {
@@ -78,51 +74,42 @@ function buildICS({ uid, summary, location, description, start, end }) {
   const dtStart = toICSDate(start);
   const dtEnd = toICSDate(end);
   return [
-    'BEGIN:VCALENDAR',
-    'VERSION:2.0',
-    'PRODID:-//Lils Ice Cream//Bookings//EN',
-    'CALSCALE:GREGORIAN',
-    'METHOD:PUBLISH',
+    'BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Lils Ice Cream//Bookings//EN','CALSCALE:GREGORIAN','METHOD:PUBLISH',
     'BEGIN:VEVENT',
-    `UID:${icsEscape(uid)}`,
-    `DTSTAMP:${now}`,
-    `DTSTART:${dtStart}`,
-    `DTEND:${dtEnd}`,
-    `SUMMARY:${icsEscape(summary)}`,
-    `LOCATION:${icsEscape(location)}`,
-    `DESCRIPTION:${icsEscape(description)}`,
-    'END:VEVENT',
-    'END:VCALENDAR',
-    ''
+    `UID:${icsEscape(uid)}`,`DTSTAMP:${now}`,`DTSTART:${dtStart}`,`DTEND:${dtEnd}`,
+    `SUMMARY:${icsEscape(summary)}`,`LOCATION:${icsEscape(location)}`,`DESCRIPTION:${icsEscape(description)}`,
+    'END:VEVENT','END:VCALENDAR',''
   ].join('\r\n');
 }
 
+// ---- Email helper ----
 async function sendIcsEmail({ to, subject, text, ics, filename }) {
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !to) {
+    console.warn('[SMTP] Missing config; skipping email.');
+    return;
+  }
   const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
+    host: SMTP_HOST,
+    port: Number(SMTP_PORT || 587),
     secure: false,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS
-    }
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
   });
-
   await transporter.sendMail({
-    from: process.env.SMTP_USER,
+    from: FROM_EMAIL || SMTP_USER,
     to,
     subject,
     text,
-    attachments: [{
-      filename: filename || 'event.ics',
-      content: ics,
-      contentType: 'text/calendar; method=PUBLISH; charset=UTF-8'
-    }]
+    attachments: [{ filename: filename || 'event.ics', content: ics, contentType: 'text/calendar; method=PUBLISH; charset=UTF-8' }]
   });
   console.log(`Emailed ICS to ${to}`);
 }
 
-// ---- iCloud CalDAV helpers ----
+// ---- iCloud CalDAV (raw PUT) ----
+function ensureAbsoluteUrl(u) {
+  if (!u) return null;
+  if (typeof u === 'object') u = u.href || String(u);
+  return /^https?:\/\//i.test(u) ? u : `https://caldav.icloud.com${u}`;
+}
 async function getIcloudCalendar() {
   const client = new DAVClient({
     serverUrl: 'https://caldav.icloud.com',
@@ -130,73 +117,39 @@ async function getIcloudCalendar() {
     authMethod: 'Basic',
     defaultAccountType: 'caldav'
   });
-
   await client.login();
-
-  // ✅ REQUIRED: initialize a CalDAV account on the client
-  await client.createAccount({
-    account: {
-      serverUrl: 'https://caldav.icloud.com',
-      accountType: 'caldav',
-      rootUrl: 'https://caldav.icloud.com'
-    }
-  });
-
-  // Now you can fetch calendars from the initialized account
+  await client.createAccount({ account: { serverUrl: 'https://caldav.icloud.com', accountType: 'caldav', rootUrl: 'https://caldav.icloud.com' } });
   const calendars = await client.fetchCalendars();
-  if (!calendars || calendars.length === 0) {
-    throw new Error('Could not fetch iCloud calendars. Check ICLOUD_USERNAME / ICLOUD_APP_PASSWORD and that Calendar is enabled.');
-  }
-
-  const target =
-    calendars.find(c => (c.displayName || '').trim() === (ICLOUD_CALENDAR_NAME || '').trim()) ||
-    calendars[0];
-
-  return { client, calendar: target };
+  if (!calendars?.length) throw new Error('No iCloud calendars found.');
+  const calendar = calendars.find(c => (c.displayName || '').trim() === (ICLOUD_CALENDAR_NAME || '').trim()) || calendars[0];
+  return { calendar };
 }
-
-function ensureAbsoluteUrl(u) {
-  if (!u) return null;
-  if (typeof u === 'object') u = u.href || String(u);
-  return /^https?:\/\//i.test(u) ? u : `https://caldav.icloud.com${u}`;
-}
-
 async function putIcsToIcloud({ calUrl, filename, ics }) {
-  const eventUrl = new URL(filename, calUrl).toString(); // absolute
-  const auth = Buffer.from(`${process.env.ICLOUD_USERNAME}:${process.env.ICLOUD_APP_PASSWORD}`).toString('base64');
-
+  const eventUrl = new URL(filename, calUrl).toString();
+  const auth = Buffer.from(`${ICLOUD_USERNAME}:${ICLOUD_APP_PASSWORD}`).toString('base64');
   const res = await fetch(eventUrl, {
     method: 'PUT',
-    headers: {
-      'Authorization': `Basic ${auth}`,
-      'Content-Type': 'text/calendar; charset=utf-8'
-      // Optional: add 'If-None-Match': '*' to prevent overwrite, or 'If-Match' with ETag if you want strict updates
-    },
+    headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'text/calendar; charset=utf-8' },
     body: ics
   });
-
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
+    const text = await res.text().catch(()=> '');
     throw new Error(`CalDAV PUT failed ${res.status}: ${text || res.statusText}`);
   }
   return res.headers.get('etag') || null;
 }
-
 async function upsertIcloudEvent({ uid, ics }) {
   const { calendar } = await getIcloudCalendar();
-
-  // normalize calendar base URL to absolute
   const rawCalUrl = calendar.url ?? calendar.href ?? calendar?.url?.href;
   const calUrl = ensureAbsoluteUrl(rawCalUrl);
-  if (!calUrl) throw new Error('iCloud calendar URL missing; cannot create/update event.');
-
+  if (!calUrl) throw new Error('iCloud calendar URL missing.');
   const filename = `${uid}.ics`;
   const etag = await putIcsToIcloud({ calUrl, filename, ics });
   console.log(`${etag ? 'Upserted' : 'Created'} iCloud event: ${filename}`);
 }
 
 // ---- Booking -> Calendar
-async function processBooking(bookingId) {
+async function processBooking(bookingId, { shouldEmail }) {
   const booking = await fetchBooking(bookingId);
   const startISO = booking.start_at;
   const durMin = booking.appointment_segments?.[0]?.duration_minutes ?? 60;
@@ -209,80 +162,87 @@ async function processBooking(bookingId) {
       first = customer.given_name || '';
       last  = customer.family_name || '';
       addressLine = formatAddress(customer.address) || 'TBD';
-    } catch (e) {
-      console.warn('Customer lookup failed:', e);
-    }
+    } catch (e) { console.warn('Customer lookup failed:', e); }
   }
 
   const fullName = `${first} ${last}`.trim() || 'Customer';
   const summary = `Truck Event – ${fullName}`;
   const description = `Square: https://squareup.com/dashboard/appointments (Booking ID: ${booking.id})`;
   const uid = `${booking.id}@lilsicecream`;
+  const ics = buildICS({ uid, summary, location: addressLine, description, start: startISO, end: endISO });
 
-  const ics = buildICS({
-    uid,
-    summary,
-    location: addressLine,
-    description,
-    start: startISO,
-    end: endISO
-  });
-
-  const filename = `${uid}.ics`;
-
-// email to you (or to customer if you want)
-await sendIcsEmail({
-  to: process.env.TO_EMAIL,
-  subject: summary,
-  text: `Booking ${booking.id}\n${description}\nLocation: ${addressLine}\nStart: ${startISO}\nEnd: ${endISO}`,
-  ics,
-  filename
-});
-
+  if (shouldEmail) {
+    await sendIcsEmail({
+      to: TO_EMAIL,
+      subject: summary,
+      text: `Booking ${booking.id}\n${description}\nLocation: ${addressLine}\nStart: ${startISO}\nEnd: ${endISO}`,
+      ics,
+      filename: `${uid}.ics`
+    });
+  }
   await upsertIcloudEvent({ uid, ics });
+}
+
+// ---- Webhook de-dupe (memory TTL) ----
+const seen = new Map(); // eventId -> expiresAt
+const DEDUPE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+function isDuplicate(eventId) {
+  if (!eventId) return false;
+  const now = Date.now();
+  // cleanup old
+  for (const [k, v] of seen) if (v < now) seen.delete(k);
+  if (seen.has(eventId)) return true;
+  seen.set(eventId, now + DEDUPE_TTL_MS);
+  return false;
 }
 
 // ---- Routes ----
 app.get('/health', (_req, res) => res.send('ok'));
 
-// (optional) list calendars to confirm the name; remove after testing
-app.get('/debug/caldav', async (_req, res) => {
-  try {
-    const client = new DAVClient({
-      serverUrl: 'https://caldav.icloud.com',
-      credentials: { username: ICLOUD_USERNAME, password: ICLOUD_APP_PASSWORD },
-      authMethod: 'Basic',
-      defaultAccountType: 'caldav'
-    });
-    await client.login();
-    const calendars = await fetchCalendars({ client });
-    res.json({ calendars: (calendars || []).map(c => c.displayName || '(no name)') });
-  } catch (e) {
-    res.status(500).send('CalDAV login failed. Check ICLOUD_USERNAME / ICLOUD_APP_PASSWORD and that Calendar is enabled.');
-  }
-});
-
 app.post('/webhooks/square', async (req, res) => {
   try {
-    const eventType = req.body?.type || 'unknown';
+    const eventType =
+      req.body?.type ||
+      req.body?.event_type ||
+      'unknown';
+
+    // Square sends an event id; try multiple shapes just in case
+    const eventId =
+      req.body?.event_id ||
+      req.body?.id ||
+      req.headers['x-square-signature'] || // last resort (not ideal)
+      null;
+
     const bookingId =
       req.body?.data?.object?.booking?.id ||
-      req.body?.data?.id; // fallback if Square payload differs
+      req.body?.data?.id ||
+      null;
 
-    console.log('Square webhook:', eventType, 'bookingId:', bookingId || '(none)');
+    console.log('Square webhook:', { eventType, eventId, bookingId });
 
-    // Skip obviously fake IDs from Square "Send Test Event"
+    // Drop dup deliveries
+    if (isDuplicate(eventId)) {
+      console.log('Duplicate webhook suppressed:', eventId);
+      return res.sendStatus(200);
+    }
+
+    // Skip fake IDs from Send Test Event
     if (!bookingId || String(bookingId).startsWith('TEST')) {
       return res.sendStatus(200);
     }
 
-    if (/booking\.(created|updated)/i.test(eventType)) {
-      await processBooking(bookingId);
+    // Decide whether to email
+    const shouldEmail = eventType === 'booking.created' ||
+                        (eventType === 'booking.updated' && SEND_EMAIL_ON_UPDATED.toLowerCase() === 'true');
+
+    if (/^booking\.(created|updated)$/i.test(eventType)) {
+      await processBooking(bookingId, { shouldEmail });
     }
+
     res.sendStatus(200);
   } catch (err) {
     console.error('Webhook error:', err?.response?.body || err);
-    res.sendStatus(200);
+    res.sendStatus(200); // avoid Square retry storms
   }
 });
 
