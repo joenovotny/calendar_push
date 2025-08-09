@@ -260,6 +260,22 @@ function isDuplicate(eventId) {
   return false;
 }
 
+async function processBookingRouter(bookingId, { shouldEmail }) {
+  // Always fetch so we can see current status
+  const booking = await fetchBooking(bookingId);
+  const status = (booking.status || booking.booking_status || '').toUpperCase();
+
+  // Treat these as cancelled
+  const isCancelled = status === 'CANCELLED' || status === 'CANCELED' || status === 'NO_SHOW';
+
+  if (isCancelled) {
+    await processCancellation(bookingId, { shouldEmail: String(process.env.SEND_EMAIL_ON_CANCELED || 'true').toLowerCase() === 'true' });
+  } else {
+    // Reuse your existing processBooking flow (it also fetches details again; that's fine)
+    await processBooking(bookingId, { shouldEmail });
+  }
+}
+
 // ---- Routes ----
 app.get('/health', (_req, res) => res.send('ok'));
 
@@ -279,18 +295,12 @@ app.post('/webhooks/square', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    if (eventType === 'booking.canceled') {
-      const shouldEmailCancel = String(process.env.SEND_EMAIL_ON_CANCELED || 'true').toLowerCase() === 'true';
-      await processCancellation(bookingId, { shouldEmail: shouldEmailCancel });
-      return res.sendStatus(200);
-    }
-
-    const shouldEmail =
-      eventType === 'booking.created' ||
-      (eventType === 'booking.updated' && (process.env.SEND_EMAIL_ON_UPDATED || 'false').toLowerCase() === 'true');
-
-    if (/^booking\.(created|updated)$/i.test(eventType)) {
-      await processBooking(bookingId, { shouldEmail });
+    // Handle both explicit cancel events and status-driven cancels
+    if (/^booking\.(created|updated|canceled|cancelled)$/i.test(eventType)) {
+      const shouldEmail =
+        eventType === 'booking.created' ||
+        (eventType === 'booking.updated' && (process.env.SEND_EMAIL_ON_UPDATED || 'false').toLowerCase() === 'true');
+      await processBookingRouter(bookingId, { shouldEmail });
     }
 
     res.sendStatus(200);
