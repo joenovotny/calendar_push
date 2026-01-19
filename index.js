@@ -60,6 +60,53 @@ async function fetchCustomer(customerId) {
   return body.customer;
 }
 
+// ---- Square sales total helpers ----
+function getTodayRangeISO() {
+  // Uses the server’s local time. Your Render instance is usually UTC.
+  // If you want America/New_York 정확히, tell me and I’ll swap this to a timezone-safe version.
+  const now = new Date();
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+
+  return { startISO: start.toISOString(), endISO: end.toISOString() };
+}
+
+async function fetchTodaySalesTotalCents() {
+  const { startISO, endISO } = getTodayRangeISO();
+
+  let cursor = null;
+  let totalCents = 0;
+  let currency = 'USD';
+
+  do {
+    const url = new URL(`${BASE}/payments`);
+    url.searchParams.set('begin_time', startISO);
+    url.searchParams.set('end_time', endISO);
+    if (cursor) url.searchParams.set('cursor', cursor);
+
+    const res = await fetch(url.toString(), { headers: authHeaders() });
+    const body = await getJson(res);
+    if (!res.ok) throw body;
+
+    const payments = body.payments || [];
+    for (const p of payments) {
+      // Count completed payments only
+      if (p.status !== 'COMPLETED') continue;
+
+      if (p.total_money && typeof p.total_money.amount === 'number') {
+        totalCents += p.total_money.amount;
+        currency = p.total_money.currency || currency;
+      }
+    }
+
+    cursor = body.cursor || null;
+  } while (cursor);
+
+  return { totalCents, currency, startISO, endISO };
+}
+
 // ---- ICS helpers ----
 function toICSDate(iso) {
   const d = new Date(iso);
@@ -287,6 +334,22 @@ async function processBookingRouter(bookingId, { shouldEmail }) {
 
 // ---- Routes ----
 app.get('/health', (_req, res) => res.send('ok'));
+
+// Returns total sales for "today"
+app.get('/square/today-total', async (_req, res) => {
+  try {
+    const result = await fetchTodaySalesTotalCents();
+    res.json({
+      totalCents: result.totalCents,
+      currency: result.currency,
+      // helpful for debugging, remove later if you want
+      range: { startISO: result.startISO, endISO: result.endISO }
+    });
+  } catch (err) {
+    console.error('today-total error:', err);
+    res.status(500).json({ error: err });
+  }
+});
 
 app.post('/webhooks/square', async (req, res) => {
   try {
