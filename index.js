@@ -25,6 +25,9 @@ const {
 } = process.env;
 
 console.log('[ENV] Loaded: SQUARE_ACCESS_TOKEN=✓  SQUARE_API_VERSION=✓  ICLOUD_USERNAME=✓  ICLOUD_APP_PASSWORD=✓');
+const BUILD_SHA = process.env.RENDER_GIT_COMMIT || process.env.COMMIT_SHA || 'unknown';
+console.log(`[BOOT] calendar_push build sha: ${BUILD_SHA}`);
+console.log(`[BOOT] square today-total route SHOULD exist. Timestamp: ${new Date().toISOString()}`);
 
 // ---- Square helpers ----
 const BASE = 'https://connect.squareup.com/v2';
@@ -334,6 +337,15 @@ async function processBookingRouter(bookingId, { shouldEmail }) {
 
 // ---- Routes ----
 app.get('/health', (_req, res) => res.send('ok'));
+
+app.get('/version', (_req, res) => {
+  res.json({
+    ok: true,
+    buildSha: BUILD_SHA,
+    hasTodayTotalRoute: true,
+    now: new Date().toISOString()
+  });
+});
 
 // Returns total sales for "today"
 app.get('/square/today-total', async (_req, res) => {
