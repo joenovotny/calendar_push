@@ -2,8 +2,13 @@
 require('dotenv/config');
 const express = require('express');
 const dayjs = require('dayjs');
+const utc = require('dayjs/plugin/utc');
+const timezone = require('dayjs/plugin/timezone');
 const { DAVClient, fetchCalendars } = require('tsdav');
 const nodemailer = require('nodemailer');
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 const app = express();
 app.use(express.json({ type: '*/*' })); // accept Square's JSON
@@ -21,6 +26,7 @@ const {
   SMTP_PASS,
   TO_EMAIL,
   FROM_EMAIL,
+  SALES_TIME_ZONE = 'America/New_York',
   SEND_EMAIL_ON_UPDATED = 'false' // set to 'true' to also email on updates
 } = process.env;
 
@@ -64,14 +70,12 @@ async function fetchCustomer(customerId) {
 }
 
 // ---- Square sales total helpers ----
-function getTodayRangeISO() {
-  // Uses the server’s local time. Your Render instance is usually UTC.
-  // If you want America/New_York 정확히, tell me and I’ll swap this to a timezone-safe version.
-  const now = new Date();
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-  const end = new Date(start);
-  end.setDate(end.getDate() + 1);
+function getTodayRangeISO(now = dayjs()) {
+  // Square's "today" follows the business timezone, independent of Render's UTC clock.
+  const localNow = dayjs(now).tz(SALES_TIME_ZONE);
+  const start = dayjs.tz(localNow.format('YYYY-MM-DD'), SALES_TIME_ZONE);
+  const nextDate = localNow.add(1, 'day').format('YYYY-MM-DD');
+  const end = dayjs.tz(nextDate, SALES_TIME_ZONE);
 
   return { startISO: start.toISOString(), endISO: end.toISOString() };
 }
